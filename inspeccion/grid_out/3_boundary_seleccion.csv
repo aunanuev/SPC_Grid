@@ -1,5 +1,5 @@
 lambda,m,tipo,regret
-0.3,0.5,g_mean_extendido,197.0978546142578
-0.3,0.5,g_worst_extendido,584.810546875
-0.3,0.5,g_mean_estandar,2494.875
-0.3,0.1,g_worst_estandar,5282.6904296875
+0.3,1.0,g_mean_extendido,1392.0728759765625
+0.3,0.5,g_worst_extendido,3790.90478515625
+0.3,0.1,g_mean_estandar,1458.606689453125
+0.3,0.1,g_worst_estandar,3400.22216796875

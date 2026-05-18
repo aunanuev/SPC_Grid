@@ -25,13 +25,20 @@ import matplotlib.pyplot as plt
 CSV_PATH = PROJECT_ROOT / "inspeccion" / "grid_out" / "4_politicas_w.csv"
 OUT_PATH = PROJECT_ROOT / "diagnostico" / "figuras" / "21_rebalanceo_portafolio.png"
 
-# orden + etiqueta humana de las politicas
-LABELS = [
-    ("low_lambda_low_m",   "low lambda, low m"),
-    ("g_mean",             "g*_mean (seleccionada)"),
-    ("high_lambda_low_m",  "high lambda, low m"),
-    ("high_lambda_high_m", "high lambda, high m"),
-]
+# Nombre humano por label. g*_mean puede coincidir con una esquina del grid
+# (p.ej. si g*_mean = (lambda_min, m_min) no se escribe low_lambda_low_m
+# porque la clave colisiona con g_mean en diag_politicas). Por eso el set de
+# labels se deriva de lo que realmente esta en el CSV, no de una lista fija.
+HUMAN = {
+    "g_mean":             "g*_mean (seleccionada)",
+    "low_lambda_low_m":   "low lambda, low m",
+    "low_lambda_high_m":  "low lambda, high m",
+    "high_lambda_low_m":  "high lambda, low m",
+    "high_lambda_high_m": "high lambda, high m",
+}
+# Orden de presentacion (g*_mean primero); solo se grafican los presentes.
+ORDER = ["g_mean", "low_lambda_low_m", "low_lambda_high_m",
+         "high_lambda_low_m", "high_lambda_high_m"]
 
 
 def main():
@@ -41,9 +48,14 @@ def main():
         index="t", columns=["label", "asset"], values="w"
     ).sort_index()
 
+    present = set(df["label"].unique())
+    LABELS = [(lbl, HUMAN.get(lbl, lbl)) for lbl in ORDER if lbl in present]
+
     fig, axes = plt.subplots(
-        len(LABELS), 1, figsize=(11, 11), sharex=True,
+        len(LABELS), 1, figsize=(11, 2.75 * len(LABELS)), sharex=True,
     )
+    if len(LABELS) == 1:
+        axes = [axes]
     for ax, (label, human) in zip(axes, LABELS):
         w_spx = wide[(label, "SPX")].values
         w_cmc = wide[(label, "CMC200")].values
@@ -76,7 +88,7 @@ def main():
 
     axes[-1].set_xlabel("t (semana, t1..t163)")
     fig.suptitle(
-        "Rebalanceo del portafolio bajo las 4 politicas guardadas\n"
+        f"Rebalanceo del portafolio bajo {len(LABELS)} politicas\n"
         "(area apilada = composicion; linea negra = magnitud del rebalanceo en cada paso)",
         fontsize=12, y=0.995,
     )

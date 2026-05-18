@@ -395,18 +395,23 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
                      seed=SCENARIO_SEED, summary_asset=SUMMARY_ASSET,
                      position=None):
     """
-    Construye un contexto compatible con solve_portfolio donde el FO y la
-    simulacion ex-post viven en el MISMO mundo (el del LSTM):
+    Construye un contexto compatible con solve_portfolio siguiendo la
+    descomposicion por regimen del PDF (ec. 2-5), con F2 (LSTM walking)
+    como fuente unica de p_{i,k,t}.
 
-      - Se generan N candidatos del LSTM (rollout autoregresivo, una vez).
-      - mu_mix(i, t) = media muestral sobre los N candidatos en el paso t.
-      - sigma_mix(i, j, t) = covarianza muestral sobre los N candidatos en t.
-      - scenarios = 5 representativos por quintiles del MISMO set de candidatos.
-      - p_dl se conserva para diagnostico (no entra al FO).
+    Diseno:
+      - p_{i,k,t} = predict_pbull_walking (LSTM aplicado a la ventana real
+        previa, ec. 15 del PDF). Misma fuente para los momentos por regimen
+        (ec. 2-3) y para la mezcla por periodo (ec. 4-5).
+      - mu_hat[(i,k)], sigma_hat[(i,j,k)] = ec. (2)-(3) con esa p.
+      - mu_mix(i,t), sigma_mix(i,j,t)     = ec. (4)-(5) con esa p.
+      - 5 escenarios = quintiles del rollout autoregresivo del LSTM.
 
-    De esta forma se cierra la "grieta ex-ante vs ex-post" del diseno previo
-    (donde mu_mix usaba p_dl x mu_hat_historico mientras los scenarios
-    muestreaban deciles del LSTM, generando hasta 766 bps/sem de gap).
+    Nota sobre coherencia ex-ante / ex-post:
+      La FO ve mu_mix derivado del walking; los escenarios viven en el
+      rollout autoregresivo. Son dos procesos distintos => existe una
+      grieta entre lo que ve la FO y lo que viven los escenarios.
+      Cuantificarla via `inspeccion/inputs_out/6_coherencia_*.csv`.
     """
     data_dir = Path(data_dir)
     base_ctx = load_market_data(str(data_dir))
@@ -414,45 +419,60 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
     regimes  = list(REGIMES)
     r_hist   = base_ctx["r"]
 
-    # --- modelo DL + historico completo de retornos ---
+    # --- modelo DL + historico ---
     model = load_checkpoint(checkpoint_path)
     H     = model.config.H
     returns_history = np.stack(
         [r_hist[i].sort_index().values[:T] for i in assets], axis=1,
     ).astype(np.float32)                                 # (T, A)
-    initial_window = returns_history[-H:, :]             # (H, A) — para escenarios
+    initial_window = returns_history[-H:, :]             # (H, A)
     T_vals = list(range(1, T + 1))
 
-    # --- N candidatos del LSTM (fuente compartida para mu/sigma y scenarios) ---
-    candidates = generate_candidate_scenarios(
-        model, initial_window, N=N_candidates, T=T, seed=seed,
-    )                                                    # (N, T, A)
-
-    # --- mu_mix / sigma_mix = momentos muestrales de los candidatos por t ---
-    mu_mix    = {i: pd.Series(0.0, index=T_vals) for i in assets}
-    sigma_mix = {i: {j: pd.Series(0.0, index=T_vals) for j in assets} for i in assets}
-    for k_t, t in enumerate(T_vals):
-        samples = candidates[:, k_t, :].astype(np.float64)   # (N, A)
-        means = samples.mean(axis=0)                         # (A,)
-        cov   = np.cov(samples, rowvar=False, ddof=0)        # (A, A)
-        # ddof=0 = MLE (poblacional); con N=1000 la diferencia con ddof=1 es < 0.1%
-        for ai, i in enumerate(assets):
-            mu_mix[i].loc[t] = float(means[ai])
-            for aj, j in enumerate(assets):
-                sigma_mix[i][j].loc[t] = float(cov[ai, aj])
-
-    # --- p_bull(t) por ventana real (solo para diagnostico, no entra al FO) ---
-    p_bull_dl = predict_pbull_walking(model, returns_history, T)
-    p_bear_dl = 1.0 - p_bull_dl
+    # --- p_{i,k,t} = F2: LSTM walking sobre ventana real previa (ec. 15) ---
+    p_bull_walking = predict_pbull_walking(model, returns_history, T)  # (T, A)
+    p_bear_walking = 1.0 - p_bull_walking
     p_dl = {
         asset: pd.DataFrame(
-            {"bear": p_bear_dl[:, ai], "bull": p_bull_dl[:, ai]},
+            {"bear": p_bear_walking[:, ai], "bull": p_bull_walking[:, ai]},
             index=T_vals,
         )
         for ai, asset in enumerate(assets)
     }
 
-    # --- 5 escenarios representativos del MISMO set de candidatos ---
+    # r_hist truncado a t=1..T y reindexado a T_vals para alinear con p_dl.
+    r_hist_T = {
+        i: pd.Series(r_hist[i].sort_index().values[:T], index=T_vals)
+        for i in assets
+    }
+
+    # --- Momentos por regimen (ec. 2-3) con p del walking ---
+    mu_hat, sigma_hat = _compute_hist_moments(r_hist_T, p_dl, assets, regimes)
+
+    # --- Mezcla por periodo (ec. 4-5) ---
+    mu_mix    = {i: pd.Series(0.0, index=T_vals) for i in assets}
+    sigma_mix = {i: {j: pd.Series(0.0, index=T_vals) for j in assets} for i in assets}
+
+    for i in assets:
+        for k in regimes:
+            mu_mix[i] += p_dl[i][k] * mu_hat[(i, k)]
+
+    for i in assets:
+        for j in assets:
+            for k in regimes:
+                sigma_mix[i][j] += p_dl[i][k] * p_dl[j][k] * sigma_hat[(i, j, k)]
+
+    # Simetrizacion numerica (la formula ya es simetrica analiticamente).
+    for i in assets:
+        for j in assets:
+            sym = 0.5 * (sigma_mix[i][j] + sigma_mix[j][i])
+            sigma_mix[i][j] = sym
+            sigma_mix[j][i] = sym
+
+    # --- N candidatos del LSTM (rollout, solo para generar los 5 escenarios) ---
+    candidates = generate_candidate_scenarios(
+        model, initial_window, N=N_candidates, T=T, seed=seed,
+    )                                                    # (N, T, A)
+
     from config import SCENARIO_POSITION
     pos = position if position is not None else SCENARIO_POSITION
     summary_idx = assets.index(summary_asset)
@@ -474,6 +494,9 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
         "r":               r_hist,
         "scenarios":       scenarios,
         "p_dl":            p_dl,
+        # Diagnostico adicional especifico de esta variante:
+        "mu_hat":          mu_hat,
+        "sigma_hat":       sigma_hat,
     }
 
 

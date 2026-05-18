@@ -115,58 +115,6 @@ def chrono_split(
     )
 
 
-def rolling_origin_splits(
-    X: np.ndarray, Y: np.ndarray, t_idx: np.ndarray,
-    initial_train_frac: float = 0.60,
-    n_folds: int = 4,
-    rolling_window_non_expansive: bool = False,
-) -> List[ChronoSplit]:
-    """Walk-forward splits con ventana de train expansiva o rolling.
-
-    Construye n_folds particiones cronologicas. El tramo inicial
-    `initial_train_frac` se reserva solo para entrenar; el resto se divide en
-    n_folds bloques de validacion NO solapados.
-
-    - Modo expansivo (`rolling_window_non_expansive=False`):
-        fold k: train = [0 : n_initial + k*v]  -- crece con cada fold.
-    - Modo rolling-window (`rolling_window_non_expansive=True`):
-        fold k: train = [k*v : n_initial + k*v]  -- tamaño fijo = n_initial,
-        descarta los datos mas viejos a medida que avanza el fold. Util para
-        mitigar drift de distribucion.
-
-    El campo test queda vacio: la evaluacion out-of-sample agregada es la
-    concatenacion de los n_folds bloques de validacion.
-    """
-    N = len(X)
-    n_initial = int(N * initial_train_frac)
-    remaining = N - n_initial
-    if remaining < n_folds:
-        raise ValueError(
-            f"N={N} y initial_train_frac={initial_train_frac} no dejan "
-            f"suficientes ventanas para {n_folds} folds."
-        )
-    v = remaining // n_folds
-
-    empty_x = np.empty((0, X.shape[1], X.shape[2]), dtype=X.dtype)
-    empty_y = np.empty((0, Y.shape[1]),             dtype=Y.dtype)
-    empty_t = np.empty(0,                           dtype=t_idx.dtype)
-
-    folds: List[ChronoSplit] = []
-    for k in range(n_folds):
-        tr_end   = n_initial + k * v
-        va_end   = tr_end + v if k < n_folds - 1 else N
-        tr_start = (tr_end - n_initial) if rolling_window_non_expansive else 0
-        folds.append(ChronoSplit(
-            X_train=X[tr_start : tr_end], Y_train=Y[tr_start : tr_end],
-            X_valid=X[tr_end : va_end],   Y_valid=Y[tr_end : va_end],
-            X_test =empty_x,              Y_test =empty_y,
-            t_train=t_idx[tr_start : tr_end],
-            t_valid=t_idx[tr_end : va_end],
-            t_test =empty_t,
-        ))
-    return folds
-
-
 def fit_standardizer(X_train: np.ndarray) -> Standardizer:
     """Media y std por activo sobre el conjunto de entrenamiento."""
     mean = X_train.mean(axis=(0, 1)).astype(np.float32)
@@ -329,118 +277,6 @@ def train_deciles(config: DLConfig) -> TrainResult:
 
 
 # =====================================================================
-# Entrenamiento rolling-origin (walk-forward)
-# =====================================================================
-
-@dataclass
-class RollingResult:
-    """Salida del entrenamiento walk-forward con ensemble de seeds.
-
-    - fold_results: mejor TrainResult por fold (la seed con mejor valid pinball).
-    - fold_state_dicts: lista de state_dicts por fold — UNA por seed entrenada.
-      La inferencia promedia las K predicciones (ensemble); el sort posterior
-      garantiza monotonicidad de los cuantiles.
-    - folds: los ChronoSplit usados, en orden cronologico.
-    - oos_preds / oos_Y / oos_t / oos_fold_id: predicciones out-of-sample
-      concatenadas en orden cronologico (cada obs viene del fold que la validaba).
-    """
-    fold_results:     List["TrainResult"]
-    fold_state_dicts: List[List[Dict]]
-    folds:            List[ChronoSplit]
-    oos_preds:        np.ndarray
-    oos_preds_raw:    np.ndarray
-    oos_Y:            np.ndarray
-    oos_t:            np.ndarray
-    oos_fold_id:      np.ndarray
-
-
-def _rebuild_net(config: DLConfig, state_dict) -> "QuantileLSTM":
-    net = QuantileLSTM(config)
-    net.load_state_dict(state_dict)
-    net.eval()
-    return net
-
-
-def train_deciles_rolling(
-    config: DLConfig,
-    initial_train_frac: Optional[float] = None,
-    n_folds:            Optional[int]   = None,
-    rolling_window_non_expansive: Optional[bool] = None,
-) -> RollingResult:
-    """Rolling-origin: un modelo por fold con seed averaging + OOS agregadas."""
-    if initial_train_frac is None:
-        initial_train_frac = getattr(config, "rolling_initial_train_frac", 0.60)
-    if n_folds is None:
-        n_folds = getattr(config, "rolling_n_folds", 4)
-    if rolling_window_non_expansive is None:
-        rolling_window_non_expansive = getattr(
-            config, "rolling_window_non_expansive", False
-        )
-
-    df_ret = load_returns()
-    X, Y, t_idx = build_windows(df_ret, config.H)
-    folds = rolling_origin_splits(
-        X, Y, t_idx, initial_train_frac, n_folds, rolling_window_non_expansive,
-    )
-
-    fold_results: List[TrainResult] = []
-    fold_state_dicts: List[List[Dict]] = []
-    oos_preds_list:     List[np.ndarray] = []
-    oos_preds_raw_list: List[np.ndarray] = []
-    oos_Y_list:         List[np.ndarray] = []
-    oos_t_list:         List[np.ndarray] = []
-    oos_fold_list:      List[np.ndarray] = []
-
-    for k, split in enumerate(folds):
-        print(f"\n=== Fold {k + 1}/{n_folds} ===")
-        print(f"  train: {len(split.X_train):>4} ventanas  "
-              f"t=[{int(split.t_train[0])}..{int(split.t_train[-1])}]")
-        print(f"  valid: {len(split.X_valid):>4} ventanas  "
-              f"t=[{int(split.t_valid[0])}..{int(split.t_valid[-1])}]")
-
-        scaler = fit_standardizer(split.X_train)
-        seed_results: List[TrainResult] = []
-        for seed in config.seeds:
-            r = _train_one(config, split, scaler, seed)
-            print(f"    seed={seed}  best_valid={r.best_valid:.6f}")
-            seed_results.append(r)
-
-        best_fold = min(seed_results, key=lambda r: r.best_valid)
-        fold_results.append(best_fold)
-        fold_state_dicts.append([r.state_dict for r in seed_results])
-
-        # Predicciones OOS con ENSEMBLE: promedio de las K seeds del fold.
-        nets_fold = [_rebuild_net(config, sd) for sd in fold_state_dicts[-1]]
-        loaded = LoadedModel(
-            nets=nets_fold,
-            config=config,
-            mean=best_fold.mean,
-            std=best_fold.std,
-        )
-        preds_va     = predict_deciles_batch(loaded, split.X_valid)               # (n_va, A, Q)
-        preds_va_raw = predict_deciles_batch(loaded, split.X_valid, sort=False)   # (n_va, A, Q)
-        oos_preds_list.append(preds_va)
-        oos_preds_raw_list.append(preds_va_raw)
-        oos_Y_list.append(split.Y_valid)
-        oos_t_list.append(split.t_valid)
-        oos_fold_list.append(np.full(len(split.X_valid), k, dtype=np.int64))
-
-        print(f"  fold best_valid={best_fold.best_valid:.6f}  "
-              f"best_seed={best_fold.best_seed}  ensemble_size={len(seed_results)}")
-
-    return RollingResult(
-        fold_results=fold_results,
-        fold_state_dicts=fold_state_dicts,
-        folds=folds,
-        oos_preds     =np.concatenate(oos_preds_list,     axis=0),
-        oos_preds_raw =np.concatenate(oos_preds_raw_list, axis=0),
-        oos_Y         =np.concatenate(oos_Y_list,         axis=0),
-        oos_t         =np.concatenate(oos_t_list,         axis=0),
-        oos_fold_id   =np.concatenate(oos_fold_list,      axis=0),
-    )
-
-
-# =====================================================================
 # Persistencia e inferencia
 # =====================================================================
 
@@ -463,54 +299,6 @@ def save_checkpoint(result: TrainResult, path: Path) -> None:
         "history":    result.history,
         "best_seed":  result.best_seed,
         "best_valid": result.best_valid,
-    }
-    torch.save(payload, path)
-
-
-def save_rolling_checkpoint(
-    result: RollingResult, config: DLConfig, path: Path,
-) -> None:
-    """Persiste el modelo del ultimo fold (mas datos de train) + OOS agregadas.
-
-    Compatible con `load_checkpoint`: las claves de primer nivel siguen siendo
-    state_dict/config/mean/std/history/best_seed/best_valid. Ademas se guardan
-    `folds` (info por fold) y `oos` (predicciones out-of-sample agregadas)
-    para que las inspecciones puedan leer metricas walk-forward sin
-    re-entrenar.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    last = result.fold_results[-1]
-
-    folds_payload = [{
-        "state_dict":  fr.state_dict,                       # mejor seed (back-compat)
-        "state_dicts": result.fold_state_dicts[k],          # ensemble (todas las seeds)
-        "mean":        fr.mean,
-        "std":         fr.std,
-        "history":     fr.history,
-        "best_seed":   fr.best_seed,
-        "best_valid":  fr.best_valid,
-        "t_train_end": int(result.folds[k].t_train[-1]),
-        "t_valid":     result.folds[k].t_valid,
-    } for k, fr in enumerate(result.fold_results)]
-
-    payload = {
-        "state_dict":  last.state_dict,                     # mejor seed (back-compat)
-        "state_dicts": result.fold_state_dicts[-1],         # ensemble del ultimo fold
-        "config":      config,
-        "mean":        last.mean,
-        "std":         last.std,
-        "history":     last.history,
-        "best_seed":   last.best_seed,
-        "best_valid":  last.best_valid,
-        "folds":       folds_payload,
-        "oos": {
-            "preds":     result.oos_preds,
-            "preds_raw": result.oos_preds_raw,
-            "Y":         result.oos_Y,
-            "t":         result.oos_t,
-            "fold_id":   result.oos_fold_id,
-        },
     }
     torch.save(payload, path)
 
@@ -656,37 +444,23 @@ def plot_fan_chart(
 if __name__ == "__main__":
     config = DLConfig()
     print(f"[train] H={config.H}  seeds={config.seeds}  deciles={config.n_quantiles}")
-    print(f"[train] rolling-origin: "
-          f"initial_train_frac={config.rolling_initial_train_frac}  "
-          f"n_folds={config.rolling_n_folds}")
+    print(f"[train] split cronologico train/valid/test = {config.split}")
 
-    result = train_deciles_rolling(config)
+    result = train_deciles(config)
     ckpt = MODELS_DIR / "decile_predictor.pt"
-    save_rolling_checkpoint(result, config, ckpt)
-    print(f"\n[train] guardado en: {ckpt}")
+    save_checkpoint(result, ckpt)
+    print(f"\n[train] best_valid={result.best_valid:.6f}  "
+          f"seed={result.best_seed}  epochs={len(result.history['train'])}")
+    print(f"[train] guardado en: {ckpt}")
 
-    # Resumen por fold.
-    print("\n=== Resumen por fold ===")
-    for k, fr in enumerate(result.fold_results):
-        print(f"  fold {k + 1}: best_valid={fr.best_valid:.6f}  "
-              f"seed={fr.best_seed}  epochs_entrenadas={len(fr.history['train'])}")
-
-    # Pinball agregada out-of-sample sobre los n_folds bloques de validacion.
-    oos_pb = pinball_loss(
-        torch.from_numpy(result.oos_preds.astype(np.float32)),
-        torch.from_numpy(result.oos_Y.astype(np.float32)),
-        config.quantiles,
-    ).item()
-    print(f"\n[train] OOS pinball agregada ({len(result.oos_Y)} obs "
-          f"sobre {len(result.fold_results)} folds): {oos_pb:.6f}")
-
-    # Fan chart sobre las predicciones OOS agregadas (walk-forward).
-    # Reconstruye X_oos concatenando los X_valid de cada fold en orden.
+    # Fan chart sobre el split de test (out-of-sample cronologico).
+    df_ret = load_returns()
+    X, Y, t_idx = build_windows(df_ret, config.H)
+    split = chrono_split(X, Y, t_idx, config.split)
     loaded = load_checkpoint(ckpt)
-    X_oos = np.concatenate([f.X_valid for f in result.folds], axis=0)
     plot_fan_chart(
-        loaded, X_oos, result.oos_Y, result.oos_t,
-        out_path=DATA_DIR / "fan_chart_oos.png",
+        loaded, split.X_test, split.Y_test, split.t_test,
+        out_path=DATA_DIR / "fan_chart_test.png",
         show=True,
-        title_suffix="OOS walk-forward",
+        title_suffix="test",
     )

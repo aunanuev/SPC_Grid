@@ -1,5 +1,0 @@
-category,model,params,test_skill_avg
-LSTM,LSTM_h16_l1_H60,1450,0.013707107254940343
-LSTM,LSTM_h24_l2_H60,7738,-0.023408976349338473
-Regression,Linear_minimal_H12,50,-0.2775739665874628
-Regression,Linear_minimal_H24,50,-0.4084937095518335

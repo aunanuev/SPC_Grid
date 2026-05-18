@@ -1,8 +1,0 @@
-campo,valor
-V_max,0.000645959553076061
-Capital_inicial,10000.0
-c_base[SPX],0.001
-w0[SPX],0.5
-c_base[CMC200],0.004
-w0[CMC200],0.5
-sum(w0),1.0

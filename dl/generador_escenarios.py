@@ -6,10 +6,13 @@ Pipeline en dos pasos:
    N trayectorias (por defecto N = 1000) de largo T (por defecto `T_HORIZON`,
    que coincide con t1..t163 del GAMS). En cada paso:
      - se predicen los deciles con el LSTM congelado;
-     - se muestrea uniformemente un nivel q ∈ Q **independiente por activo**
-       (la lectura literal del PDF usaba el mismo q para todos los activos,
-       pero eso fuerza correlacion = 1 entre SPX y CMC200 y elimina la
-       diversificacion; ver bug 3.1 de findings/Resumen_problemas.md);
+     - se muestrea uniformemente un nivel q ∈ Q **comun a todos los activos**
+       (lectura literal del PDF). El q independiente por activo se probo y
+       descartado: rompia la correlacion SPX-CMC a ~0 (historico +0.31), lo
+       que generaba escenarios "imposibles" (SPX -40% mientras CMC +1000%)
+       que secuestraban la seleccion por regret. Mismo q da corr ~0.85
+       (mas cerca del historico que 0) y escenarios ordenados de peor a
+       mejor para ambos activos;
      - se fija r_cand_{i,t} = r_hat^(q_i)_{i,t};
      - se rola la ventana (se descarta el retorno más viejo y se agrega el
        nuevo) para poder predecir el paso siguiente.
@@ -66,11 +69,12 @@ def generate_candidate_scenarios(
         # Garantizamos monotonicidad: q_idx=0 debe ser el peor caso para cada activo.
         preds = np.sort(preds, axis=-1)
 
-        # Un q independiente por activo en cada paso. La lectura literal del PDF
-        # (mismo q para todos los activos) fuerza comonotonicidad: SPX y CMC200
-        # quedan con correlacion = 1 por construccion y el optimizador no puede
-        # diversificar (bug 3.1 de findings/Resumen_problemas.md).
-        q_idx = rng.integers(low=0, high=Q, size=(N, A))                # (N, A)
+        # Mismo q para todos los activos en cada paso (lectura literal del PDF).
+        # El q independiente por activo se descarto: daba corr SPX-CMC ~0 y
+        # generaba el escenario artefacto (SPX cae / CMC explota) que
+        # secuestraba la seleccion por regret. Mismo q => corr ~0.85.
+        q_idx = np.repeat(rng.integers(low=0, high=Q, size=(N, 1)),
+                          A, axis=1)                                    # (N, A) comonotonia
         r_t   = np.take_along_axis(
             preds, q_idx[:, :, None], axis=2
         ).squeeze(-1)                                                   # (N, A)

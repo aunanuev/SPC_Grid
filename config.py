@@ -90,18 +90,6 @@ SPLIT:        Tuple[float, float, float] = (0.70, 0.15, 0.15)
 SEEDS:        Tuple[int, ...]            = (0, 1, 2)
 DEVICE:       str   = "cpu"
 
-# Rolling-origin (walk-forward) validation.
-# - initial_train_frac: fraccion inicial de ventanas reservadas solo para entrenar.
-# - n_folds: particiones del tramo restante, cada una con su propia validacion.
-# Entrenamos n_folds modelos con ventana de train expansiva; los bloques de
-# validacion no se solapan y juntos cubren (1 - initial_train_frac) del dataset,
-# lo que da un conjunto "out-of-sample" agregado mucho mas grande que un split unico.
-ROLLING_INITIAL_TRAIN_FRAC: float = 0.60
-ROLLING_N_FOLDS:            int   = 4
-# Si True, cada fold descarta los datos mas viejos para mantener un train
-# de tamaño fijo (= initial_train_frac * N). Si False, train expansivo.
-ROLLING_WINDOW_NON_EXPANSIVE: bool = True
-
 
 @dataclass
 class DLConfig:
@@ -120,9 +108,6 @@ class DLConfig:
     split:        Tuple[float, float, float] = SPLIT
     seeds:        Tuple[int, ...]        = SEEDS
     device:       str                    = DEVICE
-    rolling_initial_train_frac: float    = ROLLING_INITIAL_TRAIN_FRAC
-    rolling_n_folds:            int      = ROLLING_N_FOLDS
-    rolling_window_non_expansive: bool   = ROLLING_WINDOW_NON_EXPANSIVE
 
     @property
     def n_quantiles(self) -> int:
